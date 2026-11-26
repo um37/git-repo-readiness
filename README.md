@@ -18,31 +18,21 @@
 
 评分是基于启发式规则的工程参考，不是安全审计结论，也不能证明仓库可运行。密钥规则可能误报或漏报；绝对路径只覆盖常见 Windows 用户/程序目录和 `/Users`、`/home`。当前未执行仓库代码，不运行安装脚本，不检查 Git 历史、子模块、Git LFS 二进制、被排除目录，也不运行构建、测试或漏洞扫描。
 
-## 本地运行
+## 获取并运行
 
-需要 Python 3.10+、Node.js 20+ 和 npm。
+GitHub 仓库地址是源代码地址，并非已部署的网站。使用者需要在自己的电脑上安装 Python 3.10+、Node.js 20+、npm 和 Git，然后在任意自己选择的目录执行：
 
-```powershell
-cd D:\load\智能体\git-repo-readiness
-python -m unittest discover -s test -v
-```
-
-首次安装前端依赖并构建：
-
-```powershell
-cd D:\load\智能体\git-repo-readiness\frontend
-npm install
-npm run build
-```
-
-启动服务（从项目根目录执行）：
-
-```powershell
-cd D:\load\智能体\git-repo-readiness
+```sh
+git clone https://github.com/um37/git-repo-readiness.git
+cd git-repo-readiness
+npm --prefix frontend ci
+npm --prefix frontend run build
 python server.py
 ```
 
-打开 <http://127.0.0.1:8000>。也可在开发时运行后端 `python server.py`，另开终端执行 `cd frontend; npm run dev`，访问 Vite 输出的本地地址。默认仅监听 `127.0.0.1`；如自行设置 `HOST` 对外开放，请先为服务部署身份验证和请求频率限制。
+如果系统使用 `python3` 命令，请将最后一行改为 `python3 server.py`。服务启动后，在**运行服务的这台电脑**打开 <http://127.0.0.1:8000>，输入任意公开 GitHub 仓库的主页链接（例如 `https://github.com/um37/git-repo-readiness`）并点击“开始体检”。`127.0.0.1` 不是公网地址，其他电脑不能直接访问。
+
+可选：在项目根目录运行 `python -m unittest discover -s test -v` 检查后端逻辑。开发时可保持 `python server.py` 运行，并在另一个终端执行 `npm --prefix frontend run dev`，访问 Vite 输出的本地地址。默认仅监听 `127.0.0.1`；如自行设置 `HOST` 对外开放，请先为服务部署身份验证和请求频率限制。
 
 ## 扫描限制与更新策略
 
@@ -53,19 +43,6 @@ python server.py
 - 更新跟踪设计（尚未实现）：定期读取默认分支 HEAD SHA。若与上次报告相同，直接复用该 commit 的报告；若变化，比较两次 commit 的文件列表，按文件内容 SHA 缓存检测结果，只重扫新增、修改及新进入重点文件集合的文件，并移除已删除文件的结果，最后重新汇总评分和风险。这样不会对未变化文件重复做内容分析。
 - 失败或访问受限的兜底设计（尚未实现）：保留最近一次成功报告但显著标注“旧结果”，显示其 commit、扫描时间和失败原因，提供手动重试；绝不把旧评分当作当前 commit 的结果。当前 demo 遇到错误会清除旧报告并显示错误提示，不生成新评分。
 - 接入建议以每次提交或发布时重新扫描为准。评分阈值：85–100 较好，60–84 需完善，0–59 暂不建议接入。不同文件和规则产生的分数扣减可能重叠。
-
-## GitHub 仓库发布
-
-先在 GitHub 创建公开空仓库，再在本目录添加 remote 并推送：
-
-```powershell
-git init
-git add .
-git commit -m "feat: build Git repository readiness checker"
-git branch -M main
-git remote add origin https://github.com/<your-account>/git-repo-readiness.git
-git push -u origin main
-```
 
 ## 项目结构
 
