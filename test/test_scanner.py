@@ -42,14 +42,17 @@ class ScannerTests(unittest.TestCase):
         parser = EmbeddedDataParser()
         parser.feed('<script type="application/json" data-target="react-app.embeddedData">{"payload":{"ok":true}}</script>')
         self.assertTrue(parser.data["payload"]["ok"])
-        root = {"codeViewRepoRoute": {"refInfo": {"name": "main"}, "tree": {"items": [
+        commit = "a" * 40
+        root = {"codeViewRepoRoute": {"refInfo": {"name": "main", "currentOid": commit}, "tree": {"items": [
             {"path": "README.md", "contentType": "file"},
             {"path": "package.json", "contentType": "file"},
         ]}}, "sidebarAbout": {"description": "demo"}}
         files = {"README.md": "安装依赖，然后运行项目。" * 10, "package.json": '{"scripts":{"start":"node app.js"}}'}
-        with patch("scanner.github_page", return_value=root), patch("scanner.github_file", side_effect=lambda repo, branch, path: files[path]):
+        with patch("scanner.github_page", return_value=root), patch("scanner.github_file", side_effect=lambda repo, ref, path: files[path]) as read_file:
             report = analyze_repository("https://github.com/example/demo")
         self.assertEqual(report["score"], 100)
+        self.assertEqual(report["repository"]["commit"], commit)
+        self.assertTrue(all(call.args[1] == commit for call in read_file.call_args_list))
         self.assertEqual(report["coverage"]["scannedFiles"], 2)
         self.assertFalse(report["coverage"]["limited"])
 

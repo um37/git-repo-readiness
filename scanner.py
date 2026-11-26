@@ -196,6 +196,9 @@ def analyze_repository(value):
     branch = route["refInfo"]["name"]
     if not branch:
         raise ScanError("空仓库没有可扫描的默认分支。")
+    commit = route["refInfo"].get("currentOid")
+    if not commit:
+        raise ScanError("无法确认默认分支的 commit，请稍后重试。")
     entries = []
     pending = [item for item in route["tree"]["items"] if item["contentType"] == "directory"]
     entries.extend({"path": item["path"], "type": "blob", "size": 0} for item in route["tree"]["items"] if item["contentType"] == "file")
@@ -206,7 +209,7 @@ def analyze_repository(value):
             batch = pending[:min(5, MAX_DIRS - visited)]
             del pending[:len(batch)]
             visited += len(batch)
-            results = list(pool.map(lambda item: read_directory(repo, branch, item), batch))
+            results = list(pool.map(lambda item: read_directory(repo, commit, item), batch))
             for items in results:
                 if items is None:
                     unreadable_dirs += 1
@@ -219,7 +222,7 @@ def analyze_repository(value):
     unreadable = 0
     large = 0
     with ThreadPoolExecutor(max_workers=5) as pool:
-        results = list(pool.map(lambda entry: read_file(repo, branch, entry), selected))
+        results = list(pool.map(lambda entry: read_file(repo, commit, entry), selected))
     for entry, result in zip(selected, results):
         kind, content = result
         if kind == "ok":
@@ -228,7 +231,7 @@ def analyze_repository(value):
             large += 1
         else:
             unreadable += 1
-    return {"repository": {**repo, "description": page.get("sidebarAbout", {}).get("description") or "", "defaultBranch": branch, "updatedAt": None},
+    return {"repository": {**repo, "description": page.get("sidebarAbout", {}).get("description") or "", "defaultBranch": branch, "commit": commit},
             **evaluate_tree(entries, contents, tree_truncated=bool(pending or unreadable_dirs), skipped_large_files=large, unreadable_files=unreadable),
             "scannedAt": datetime.now(timezone.utc).isoformat()}
 
