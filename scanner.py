@@ -1,16 +1,17 @@
 """Read-only readiness checks for public GitHub repositories."""
 
-import base64
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
-API = "https://api.github.com"
-MAX_FILES = 40
+MAX_FILES = 20
 MAX_FILE_SIZE = 120_000
+MAX_DIRS = 6
 SOURCE = re.compile(r"\.(?:js|jsx|ts|tsx|py|go|rs|java|kt|rb|php|sh|yml|yaml|json|toml|ini|cfg|conf|properties|md|txt|bat|cmd|ps1|vbs)$", re.I)
 SKIP = re.compile(r"(?:^|/)(?:node_modules|vendor|dist|build|\.git|\.next|coverage)/|(?:^|/)(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|poetry\.lock)$", re.I)
 MANIFEST = re.compile(r"(?:^|/)(?:package\.json|requirements(?:-[^/]*)?\.txt|pyproject\.toml|Pipfile|go\.mod|Cargo\.toml|pom\.xml|build\.gradle(?:\.kts)?|Gemfile|composer\.json)$", re.I)
@@ -47,19 +48,55 @@ def parse_github_url(value):
     return {"owner": owner, "repo": repo, "url": f"https://github.com/{owner}/{repo}"}
 
 
-def github_json(path):
-    request = Request(API + path, headers={"Accept": "application/vnd.github+json", "User-Agent": "repo-readiness/1.0"})
+class EmbeddedDataParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_data = False
+        self.data = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        self.in_data = tag == "script" and attributes.get("data-target") == "react-app.embeddedData"
+
+    def handle_data(self, data):
+        if self.in_data:
+            self.data = json.loads(data)
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self.in_data = False
+
+
+def github_page(url):
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         with urlopen(request, timeout=12) as response:
-            return json.load(response)
+            parser = EmbeddedDataParser()
+            parser.feed(response.read().decode("utf-8"))
+            if parser.data is None:
+                raise ScanError("无法读取 GitHub 仓库页面。")
+            return parser.data["payload"]
     except HTTPError as error:
         if error.code == 404:
-            raise ScanError("仓库不存在、不是公开仓库，或默认分支不可读取。") from error
+            raise ScanError("仓库不存在或不是公开仓库。") from error
         if error.code in (403, 429):
-            raise ScanError("GitHub API 请求受限，请稍后重试。") from error
+            raise ScanError("GitHub 页面暂时限制访问，请稍后重试。") from error
         raise ScanError(f"GitHub 请求失败（HTTP {error.code}）。") from error
     except URLError as error:
         raise ScanError("无法连接 GitHub，请检查网络后重试。") from error
+
+
+def github_file(repo, branch, path):
+    url = f"https://raw.githubusercontent.com/{repo['owner']}/{repo['repo']}/{quote(branch, safe='')}/{quote(path, safe='/')}"
+    request = Request(url, headers={"User-Agent": "repo-readiness/1.0"})
+    with urlopen(request, timeout=12) as response:
+        content = response.read(MAX_FILE_SIZE + 1)
+    return content.decode("utf-8", errors="replace") if len(content) <= MAX_FILE_SIZE else None
+
+
+def directory_items(repo, branch, directory):
+    url = f"{repo['url']}/tree/{quote(branch, safe='')}/{quote(directory['path'], safe='/')}"
+    return github_page(url)["codeViewTreeRoute"]["tree"]["items"]
 
 
 def make_finding(identifier, severity, title, detail, paths=()):
@@ -154,29 +191,58 @@ def evaluate_tree(entries, contents, *, tree_truncated=False, skipped_large_file
 
 def analyze_repository(value):
     repo = parse_github_url(value)
-    base = f"/repos/{repo['owner']}/{repo['repo']}"
-    info = github_json(base)
-    if info.get("private"):
-        raise ScanError("目前仅支持公开仓库。")
-    branch = info.get("default_branch")
+    page = github_page(repo["url"])
+    route = page["codeViewRepoRoute"]
+    branch = route["refInfo"]["name"]
     if not branch:
         raise ScanError("空仓库没有可扫描的默认分支。")
-    tree = github_json(f"{base}/git/trees/{quote(branch, safe='')}?recursive=1")
-    entries = tree.get("tree", [])
+    entries = []
+    pending = [item for item in route["tree"]["items"] if item["contentType"] == "directory"]
+    entries.extend({"path": item["path"], "type": "blob", "size": 0} for item in route["tree"]["items"] if item["contentType"] == "file")
+    visited = 0
+    unreadable_dirs = 0
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        while pending and visited < MAX_DIRS:
+            batch = pending[:min(5, MAX_DIRS - visited)]
+            del pending[:len(batch)]
+            visited += len(batch)
+            results = list(pool.map(lambda item: read_directory(repo, branch, item), batch))
+            for items in results:
+                if items is None:
+                    unreadable_dirs += 1
+                    continue
+                entries.extend({"path": item["path"], "type": "blob", "size": 0} for item in items if item["contentType"] == "file")
+                pending.extend(item for item in items if item["contentType"] == "directory" and not SKIP.search(item["path"] + "/"))
     source_files = [entry for entry in entries if entry.get("type") == "blob" and SOURCE.search(entry["path"]) and not SKIP.search(entry["path"])]
-    eligible = [entry for entry in source_files if isinstance(entry.get("size"), int) and entry["size"] <= MAX_FILE_SIZE]
-    selected = sorted(eligible, key=lambda entry: (priority(entry["path"]), len(entry["path"]), entry["path"]))[:MAX_FILES]
+    selected = sorted(source_files, key=lambda entry: (priority(entry["path"]), len(entry["path"]), entry["path"]))[:MAX_FILES]
     contents = {}
     unreadable = 0
-    for entry in selected:
-        try:
-            blob = github_json(f"{base}/git/blobs/{entry['sha']}")
-            if blob.get("encoding") == "base64":
-                contents[entry["path"]] = base64.b64decode(blob["content"]).decode("utf-8", errors="replace")
-            else:
-                unreadable += 1
-        except (ScanError, KeyError, ValueError):
+    large = 0
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(pool.map(lambda entry: read_file(repo, branch, entry), selected))
+    for entry, result in zip(selected, results):
+        kind, content = result
+        if kind == "ok":
+            contents[entry["path"]] = content
+        elif kind == "large":
+            large += 1
+        else:
             unreadable += 1
-    return {"repository": {**repo, "description": info.get("description") or "", "defaultBranch": branch, "updatedAt": info.get("pushed_at")},
-            **evaluate_tree(entries, contents, tree_truncated=bool(tree.get("truncated")), skipped_large_files=len(source_files) - len(eligible), unreadable_files=unreadable),
+    return {"repository": {**repo, "description": page.get("sidebarAbout", {}).get("description") or "", "defaultBranch": branch, "updatedAt": None},
+            **evaluate_tree(entries, contents, tree_truncated=bool(pending or unreadable_dirs), skipped_large_files=large, unreadable_files=unreadable),
             "scannedAt": datetime.now(timezone.utc).isoformat()}
+
+
+def read_directory(repo, branch, directory):
+    try:
+        return directory_items(repo, branch, directory)
+    except (ScanError, KeyError, ValueError):
+        return None
+
+
+def read_file(repo, branch, entry):
+    try:
+        content = github_file(repo, branch, entry["path"])
+        return ("ok", content) if content is not None else ("large", None)
+    except (HTTPError, URLError, ValueError):
+        return ("unreadable", None)

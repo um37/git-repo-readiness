@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import patch
 
-from scanner import ScanError, evaluate_tree, parse_github_url
+from scanner import EmbeddedDataParser, ScanError, analyze_repository, evaluate_tree, parse_github_url
 
 
 def entry(path):
@@ -36,6 +37,21 @@ class ScannerTests(unittest.TestCase):
         report = evaluate_tree([entry("README.md"), entry("app.py")], {"README.md": "安装运行" * 30})
         self.assertTrue(report["coverage"]["limited"])
         self.assertEqual(report["coverage"]["scannedFiles"], 1)
+
+    def test_public_page_scan_without_rest_api(self):
+        parser = EmbeddedDataParser()
+        parser.feed('<script type="application/json" data-target="react-app.embeddedData">{"payload":{"ok":true}}</script>')
+        self.assertTrue(parser.data["payload"]["ok"])
+        root = {"codeViewRepoRoute": {"refInfo": {"name": "main"}, "tree": {"items": [
+            {"path": "README.md", "contentType": "file"},
+            {"path": "package.json", "contentType": "file"},
+        ]}}, "sidebarAbout": {"description": "demo"}}
+        files = {"README.md": "安装依赖，然后运行项目。" * 10, "package.json": '{"scripts":{"start":"node app.js"}}'}
+        with patch("scanner.github_page", return_value=root), patch("scanner.github_file", side_effect=lambda repo, branch, path: files[path]):
+            report = analyze_repository("https://github.com/example/demo")
+        self.assertEqual(report["score"], 100)
+        self.assertEqual(report["coverage"]["scannedFiles"], 2)
+        self.assertFalse(report["coverage"]["limited"])
 
 
 if __name__ == "__main__":
